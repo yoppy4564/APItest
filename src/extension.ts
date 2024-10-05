@@ -1,93 +1,114 @@
 import * as vscode from 'vscode';
-import axios from 'axios'; // axiosをインポート
+import axios from 'axios';
 
-// WebviewViewProviderを実装するクラス
 class ChatGptViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'chatGptSidebar';
+    private conversationHistory: { role: string; content: string }[] = [];
 
-    constructor(private readonly context: vscode.ExtensionContext) { }
+    constructor(private readonly context: vscode.ExtensionContext) {
+        // 保存された会話履歴を読み込む
+        this.conversationHistory = context.workspaceState.get('conversationHistory', []);
+    }
 
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
-        context: vscode.WebviewViewResolveContext,
-        token: vscode.CancellationToken
+        _context: vscode.WebviewViewResolveContext,
+        _token: vscode.CancellationToken
     ) {
-        console.log('resolveWebviewView called');
-
         webviewView.webview.options = {
-            enableScripts: true
+            enableScripts: true,
+            localResourceRoots: [
+                vscode.Uri.joinPath(this.context.extensionUri, 'media')
+            ]
         };
 
-        webviewView.webview.html = this.getWebviewContent();
+        webviewView.webview.html = this.getWebviewContent(webviewView.webview);
 
-        // メッセージ受信時のハンドリング
+        // Webviewからのメッセージを処理
         webviewView.webview.onDidReceiveMessage(
             async message => {
                 switch (message.command) {
                     case 'sendMessage':
-                        const response = await this.getChatGptResponse(message.text);
-                        webviewView.webview.postMessage({ command: 'response', text: response });
+                        this.conversationHistory.push({ role: 'user', content: message.text });
+
+                        // 会話履歴の長さを制限（最大20メッセージ）
+                        const maxHistoryLength = 20;
+                        if (this.conversationHistory.length > maxHistoryLength) {
+                            this.conversationHistory.splice(0, this.conversationHistory.length - maxHistoryLength);
+                        }
+
+                        // ローディング表示を開始
+                        webviewView.webview.postMessage({ command: 'loading' });
+
+                        const responseText = await this.getChatGptResponse();
+
+                        // ローディング表示を終了し、レスポンスを送信
+                        webviewView.webview.postMessage({ command: 'response', text: responseText });
+
+                        // 会話履歴を保存
+                        this.context.workspaceState.update('conversationHistory', this.conversationHistory);
+                        return;
+
+                    case 'clearConversation':
+                        this.conversationHistory = [];
+                        webviewView.webview.postMessage({ command: 'conversationCleared' });
+
+                        // 会話履歴を保存
+                        this.context.workspaceState.update('conversationHistory', this.conversationHistory);
                         return;
                 }
             },
             undefined,
             this.context.subscriptions
         );
+
+        // Webviewが読み込まれたときに会話履歴を送信
+        webviewView.webview.postMessage({ command: 'loadHistory', history: this.conversationHistory });
+
+        // Webviewが復元されたときに会話履歴を再送信
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                webviewView.webview.postMessage({ command: 'loadHistory', history: this.conversationHistory });
+            }
+        });
     }
 
-    private getWebviewContent(): string {
+    private getWebviewContent(webview: vscode.Webview): string {
+        const styleUri = webview.asWebviewUri(
+            vscode.Uri.joinPath(this.context.extensionUri, 'media', 'styles.css')
+        );
+        const scriptUri = webview.asWebviewUri(
+            vscode.Uri.joinPath(this.context.extensionUri, 'media', 'script.js')
+        );
+        const markedUri = webview.asWebviewUri(
+            vscode.Uri.joinPath(this.context.extensionUri, 'media', 'marked.min.js')
+        );
+
         return `
         <!DOCTYPE html>
         <html lang="ja">
         <head>
             <meta charset="UTF-8">
             <title>ChatGPT</title>
-            <style>
-                body { font-family: sans-serif; padding: 10px; }
-                #chatBox { width: 100%; height: 300px; border: 1px solid #ccc; padding: 5px; overflow-y: scroll; }
-                #userInput { width: 80%; }
-                #sendButton { width: 18%; }
-            </style>
+            <link href="${styleUri}" rel="stylesheet">
         </head>
         <body>
-            <div id="chatBox"></div>
-            <input type="text" id="userInput" placeholder="メッセージを入力してください" />
-            <button id="sendButton">送信</button>
-
-            <script>
-                const vscode = acquireVsCodeApi();
-
-                document.getElementById('sendButton').addEventListener('click', () => {
-                    const input = document.getElementById('userInput').value;
-                    if (input.trim() === '') return;
-                    appendMessage('あなた', input);
-                    vscode.postMessage({ command: 'sendMessage', text: input });
-                    document.getElementById('userInput').value = '';
-                });
-
-                window.addEventListener('message', event => {
-                    const message = event.data;
-                    switch (message.command) {
-                        case 'response':
-                            appendMessage('ChatGPT', message.text);
-                            break;
-                    }
-                });
-
-                function appendMessage(sender, text) {
-                    const chatBox = document.getElementById('chatBox');
-                    const messageElem = document.createElement('div');
-                    messageElem.innerHTML = '<strong>' + sender + ':</strong> ' + text;
-                    chatBox.appendChild(messageElem);
-                    chatBox.scrollTop = chatBox.scrollHeight;
-                }
-            </script>
+            <div id="chatContainer">
+                <div id="chatBox"></div>
+            </div>
+            <div id="inputContainer">
+                <textarea id="userInput" placeholder="メッセージを入力"></textarea>
+                <button id="sendButton">➤</button>
+                <button id="clearButton">クリア</button>
+            </div>
+            <script src="${markedUri}"></script>
+            <script src="${scriptUri}"></script>
         </body>
         </html>
         `;
     }
 
-    private async getChatGptResponse(prompt: string): Promise<string> {
+    private async getChatGptResponse(): Promise<string> {
         const config = vscode.workspace.getConfiguration('vscode-chatgpt');
         const apiKey = config.get<string>('chatGptApiKey');
 
@@ -96,33 +117,43 @@ class ChatGptViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            const response = await axios.post('https://api.openai.com/v1/chat/completions', {
-                model: 'gpt-3.5-turbo',
-                messages: [{ role: 'user', content: prompt }],
-                max_tokens: 150
-            }, {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${apiKey}`
+            const response = await axios.post(
+                'https://api.openai.com/v1/chat/completions',
+                {
+                    model: 'gpt-3.5-turbo',
+                    messages: this.conversationHistory,
+                    max_tokens: 2048, // 必要に応じて調整
+                },
+                {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiKey}`,
+                    },
+                    // タイムアウトを設定（必要に応じて）
+                    timeout: 60000, // 60秒
                 }
-            });
+            );
 
             const data = response.data;
 
             if (data.choices && data.choices.length > 0 && data.choices[0].message) {
-                return data.choices[0].message.content.trim();
+                const assistantMessage = data.choices[0].message.content.trim();
+
+                this.conversationHistory.push({ role: 'assistant', content: assistantMessage });
+
+                // 会話履歴を保存
+                this.context.workspaceState.update('conversationHistory', this.conversationHistory);
+
+                return assistantMessage;
             } else {
                 return '予期しないレスポンス形式です。';
             }
         } catch (error: any) {
             if (error.response) {
-                // サーバーからのエラーレスポンス
-                return `エラー: ${error.response.status} - ${JSON.stringify(error.response.data)}`;
+                return `エラー: ${error.response.status} - ${error.response.data.error.message}`;
             } else if (error.request) {
-                // リクエストが送信されたがレスポンスが受信できなかった場合
-                return 'エラー: レスポンスが受信できませんでした。';
+                return 'エラー: レスポンスが受信できませんでした。ネットワークを確認してください。';
             } else {
-                // その他のエラー
                 return `エラーが発生しました: ${error.message || error}`;
             }
         }
@@ -137,7 +168,6 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewViewProvider(ChatGptViewProvider.viewType, provider)
     );
 
-    // コマンドを登録
     let disposable = vscode.commands.registerCommand('chatgpt.sayHello', () => {
         vscode.window.showInformationMessage('Hello from ChatGPT extension!');
     });
@@ -145,4 +175,4 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable);
 }
 
-export function deactivate() { }
+export function deactivate() {}
